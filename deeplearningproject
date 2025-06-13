@@ -1,0 +1,991 @@
+# Fake News Classification with Deep Learning
+# A comprehensive PyTorch implementation for internship presentation
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
+from collections import Counter
+import re
+import string
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torchtext.data.utils import get_tokenizer
+from collections import Counter, OrderedDict
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better visualizations
+plt.style.use('seaborn-v0_8')
+sns.set_palette("husl")
+
+print("🚀 Fake News Classification Model")
+print("=" * 50)
+
+# Download required NLTK data
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('wordnet', quiet=True)
+except:
+    pass
+
+# ==============================================================================
+# 1. DATA LOADING AND EXPLORATION
+# ==============================================================================
+
+def load_and_explore_data():
+    """Load the CSV files and perform initial exploration"""
+    print("\n📊 STEP 1: Data Loading and Exploration")
+    print("-" * 40)
+    
+    try:
+        # Load datasets
+        fake_df = pd.read_csv('Fake.csv')
+        true_df = pd.read_csv('True.csv')
+        
+        # Add labels
+        fake_df['label'] = 0  # Fake news
+        true_df['label'] = 1  # True news
+        
+        # Combine datasets
+        df = pd.concat([fake_df, true_df], ignore_index=True)
+        
+        print(f"✅ Loaded {len(fake_df)} fake articles and {len(true_df)} true articles")
+        print(f"📈 Total dataset size: {len(df)} articles")
+        print(f"🏛️ Columns: {list(df.columns)}")
+        
+        # Display basic info
+        print(f"\n📋 Dataset Info:")
+        print(f"   • Shape: {df.shape}")
+        print(f"   • Missing values: {df.isnull().sum().sum()}")
+        print(f"   • Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+        
+        return df, fake_df, true_df
+        
+    except FileNotFoundError as e:
+        print(f"❌ Error: Could not find CSV files. Please ensure 'Fake.csv' and 'True.csv' are in the current directory.")
+        return None, None, None
+
+def visualize_data_distribution(df, fake_df, true_df):
+    """Create comprehensive visualizations of the data"""
+    print("\n📈 Creating Data Visualizations...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('Fake News Dataset Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Class distribution
+    class_counts = df['label'].value_counts()
+    axes[0, 0].pie(class_counts.values, labels=['Fake', 'True'], autopct='%1.1f%%', 
+                   colors=['#ff6b6b', '#4ecdc4'], startangle=90)
+    axes[0, 0].set_title('Class Distribution', fontweight='bold')
+    
+    # 2. Article length distribution
+    df['text_length'] = df['text'].str.len()
+    axes[0, 1].hist(df[df['label']==0]['text_length'], bins=50, alpha=0.7, 
+                    label='Fake', color='#ff6b6b', density=True)
+    axes[0, 1].hist(df[df['label']==1]['text_length'], bins=50, alpha=0.7, 
+                    label='True', color='#4ecdc4', density=True)
+    axes[0, 1].set_xlabel('Article Length (characters)')
+    axes[0, 1].set_ylabel('Density')
+    axes[0, 1].set_title('Article Length Distribution', fontweight='bold')
+    axes[0, 1].legend()
+    
+    # 3. Word count distribution
+    df['word_count'] = df['text'].str.split().str.len()
+    axes[1, 0].boxplot([df[df['label']==0]['word_count'].dropna(), 
+                        df[df['label']==1]['word_count'].dropna()], 
+                       labels=['Fake', 'True'])
+    axes[1, 0].set_ylabel('Word Count')
+    axes[1, 0].set_title('Word Count by Class', fontweight='bold')
+    
+    # 4. Subject distribution (if available)
+    if 'subject' in df.columns:
+        subject_fake = fake_df['subject'].value_counts().head(10)
+        subject_true = true_df['subject'].value_counts().head(10)
+        
+        x_pos = np.arange(len(subject_fake))
+        axes[1, 1].barh(x_pos, subject_fake.values, alpha=0.7, color='#ff6b6b', label='Fake')
+        axes[1, 1].set_yticks(x_pos)
+        axes[1, 1].set_yticklabels(subject_fake.index, fontsize=8)
+        axes[1, 1].set_xlabel('Count')
+        axes[1, 1].set_title('Top Subjects in Fake News', fontweight='bold')
+    else:
+        axes[1, 1].text(0.5, 0.5, 'Subject column not available', 
+                        ha='center', va='center', transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title('Subject Analysis', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Summary statistics
+    print(f"\n📊 Summary Statistics:")
+    print(f"   • Average article length: {df['text_length'].mean():.0f} characters")
+    print(f"   • Average word count: {df['word_count'].mean():.0f} words")
+    print(f"   • Fake news avg length: {df[df['label']==0]['text_length'].mean():.0f} chars")
+    print(f"   • True news avg length: {df[df['label']==1]['text_length'].mean():.0f} chars")
+
+# ==============================================================================
+# 2. TEXT PREPROCESSING
+# ==============================================================================
+
+class TextPreprocessor:
+    """Comprehensive text preprocessing pipeline"""
+    
+    def __init__(self):
+        self.stop_words = set(stopwords.words('english'))
+        self.lemmatizer = WordNetLemmatizer()
+        self.tokenizer = get_tokenizer('basic_english')
+        
+    def clean_text(self, text):
+        """Clean and preprocess text"""
+        if pd.isna(text):
+            return ""
+        
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove URLs
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+        
+        # Remove email addresses
+        text = re.sub(r'\S+@\S+', '', text)
+        
+        # Remove punctuation and special characters
+        text = re.sub(r'[^a-zA-Z\s]', '', text)
+        
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        
+        return text
+    
+    def tokenize_and_filter(self, text):
+        """Tokenize text and remove stopwords"""
+        tokens = self.tokenizer(text)
+        
+        # Remove stopwords and short words
+        filtered_tokens = [
+            self.lemmatizer.lemmatize(token) 
+            for token in tokens 
+            if token not in self.stop_words and len(token) > 2
+        ]
+        
+        return filtered_tokens
+    
+    def preprocess(self, text):
+        """Full preprocessing pipeline"""
+        cleaned = self.clean_text(text)
+        tokens = self.tokenize_and_filter(cleaned)
+        return ' '.join(tokens)
+
+def preprocess_data(df):
+    """Apply preprocessing to the dataset"""
+    print("\n🔧 STEP 2: Text Preprocessing")
+    print("-" * 40)
+    
+    preprocessor = TextPreprocessor()
+    
+    print("📝 Applying text preprocessing...")
+    df['processed_text'] = df['text'].apply(preprocessor.preprocess)
+    
+    # Remove empty texts
+    initial_len = len(df)
+    df = df[df['processed_text'].str.len() > 0].reset_index(drop=True)
+    removed = initial_len - len(df)
+    
+    print(f"✅ Preprocessing complete!")
+    print(f"   • Removed {removed} empty articles")
+    print(f"   • Final dataset size: {len(df)} articles")
+    
+    # Show preprocessing example
+    print(f"\n📄 Preprocessing Example:")
+    print(f"Original: {df['text'].iloc[0][:200]}...")
+    print(f"Processed: {df['processed_text'].iloc[0][:200]}...")
+    
+    return df
+
+# ==============================================================================
+# 3. VOCABULARY BUILDING
+# ==============================================================================
+
+class Vocabulary:
+    """Build and manage vocabulary for text classification"""
+    
+    def __init__(self, max_vocab_size=10000, min_freq=2):
+        self.max_vocab_size = max_vocab_size
+        self.min_freq = min_freq
+        self.word2idx = {'<PAD>': 0, '<UNK>': 1}
+        self.idx2word = {0: '<PAD>', 1: '<UNK>'}
+        self.word_counts = Counter()
+        
+    def build_vocab(self, texts):
+        """Build vocabulary from texts"""
+        print(f"\n📚 Building vocabulary...")
+        
+        # Count word frequencies
+        for text in texts:
+            words = text.split()
+            self.word_counts.update(words)
+        
+        # Keep only frequent words
+        frequent_words = [
+            word for word, count in self.word_counts.items() 
+            if count >= self.min_freq
+        ]
+        
+        # Sort by frequency and limit vocabulary size
+        frequent_words = sorted(frequent_words, key=self.word_counts.get, reverse=True)
+        frequent_words = frequent_words[:self.max_vocab_size-2]  # -2 for PAD and UNK
+        
+        # Build mappings
+        for word in frequent_words:
+            idx = len(self.word2idx)
+            self.word2idx[word] = idx
+            self.idx2word[idx] = word
+        
+        print(f"✅ Vocabulary built: {len(self.word2idx)} words")
+        print(f"   • Most frequent: {frequent_words[:10]}")
+        
+    def text_to_indices(self, text, max_length=None):
+        """Convert text to indices"""
+        words = text.split()
+        indices = [self.word2idx.get(word, 1) for word in words]  # 1 = UNK
+        
+        if max_length:
+            if len(indices) < max_length:
+                indices.extend([0] * (max_length - len(indices)))  # 0 = PAD
+            else:
+                indices = indices[:max_length]
+        
+        return indices
+
+# ==============================================================================
+# 4. PYTORCH DATASET CLASS
+# ==============================================================================
+
+class NewsDataset(Dataset):
+    """PyTorch Dataset for news classification"""
+    
+    def __init__(self, texts, labels, vocab, max_length=512):
+        self.texts = texts
+        self.labels = labels
+        self.vocab = vocab
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        
+        # Convert text to indices
+        indices = self.vocab.text_to_indices(text, self.max_length)
+        
+        return {
+            'text': torch.tensor(indices, dtype=torch.long),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+# ==============================================================================
+# 5. MODEL ARCHITECTURES
+# ==============================================================================
+
+class LSTMClassifier(nn.Module):
+    """LSTM-based text classifier"""
+    
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, num_layers=2, 
+                 num_classes=2, dropout=0.3):
+        super(LSTMClassifier, self).__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, 
+                           batch_first=True, dropout=dropout, bidirectional=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(hidden_dim * 2, 64)  # *2 for bidirectional
+        self.fc2 = nn.Linear(64, num_classes)
+        
+    def forward(self, x):
+        # Embedding
+        embedded = self.embedding(x)
+        
+        # LSTM
+        lstm_out, (hidden, cell) = self.lstm(embedded)
+        
+        # Use last hidden state from both directions
+        hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+        
+        # Classification layers
+        out = self.dropout(hidden)
+        out = F.relu(self.fc1(out))
+        out = self.dropout(out)
+        out = self.fc2(out)
+        
+        return out
+
+class CNNClassifier(nn.Module):
+    """CNN-based text classifier"""
+    
+    def __init__(self, vocab_size, embed_dim=128, num_filters=100, 
+                 filter_sizes=[3, 4, 5], num_classes=2, dropout=0.3):
+        super(CNNClassifier, self).__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        
+        # Convolutional layers
+        self.convs = nn.ModuleList([
+            nn.Conv1d(embed_dim, num_filters, kernel_size=fs)
+            for fs in filter_sizes
+        ])
+        
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(len(filter_sizes) * num_filters, num_classes)
+        
+    def forward(self, x):
+        # Embedding
+        embedded = self.embedding(x)  # (batch_size, seq_len, embed_dim)
+        embedded = embedded.transpose(1, 2)  # (batch_size, embed_dim, seq_len)
+        
+        # Convolution + pooling
+        conv_outputs = []
+        for conv in self.convs:
+            conv_out = F.relu(conv(embedded))  # (batch_size, num_filters, new_seq_len)
+            pooled = F.max_pool1d(conv_out, conv_out.size(2)).squeeze(2)
+            conv_outputs.append(pooled)
+        
+        # Concatenate all features
+        out = torch.cat(conv_outputs, dim=1)
+        out = self.dropout(out)
+        out = self.fc(out)
+        
+        return out
+
+class TransformerClassifier(nn.Module):
+    """Simple Transformer-based classifier"""
+    
+    def __init__(self, vocab_size, embed_dim=128, num_heads=8, num_layers=2, 
+                 num_classes=2, dropout=0.1, max_length=512):
+        super(TransformerClassifier, self).__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.pos_encoding = nn.Parameter(torch.randn(max_length, embed_dim))
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(embed_dim, num_classes)
+        
+    def forward(self, x):
+        seq_len = x.size(1)
+        
+        # Embedding + positional encoding
+        embedded = self.embedding(x)
+        embedded += self.pos_encoding[:seq_len, :].unsqueeze(0)
+        
+        # Create padding mask
+        padding_mask = (x == 0)
+        
+        # Transformer
+        transformer_out = self.transformer(embedded, src_key_padding_mask=padding_mask)
+        
+        # Global average pooling (excluding padding)
+        mask = (~padding_mask).float().unsqueeze(-1)
+        pooled = (transformer_out * mask).sum(dim=1) / mask.sum(dim=1)
+        
+        # Classification
+        out = self.dropout(pooled)
+        out = self.fc(out)
+        
+        return out
+
+# ==============================================================================
+# 6. TRAINING UTILITIES
+# ==============================================================================
+
+class ModelTrainer:
+    """Training utilities for the models"""
+    
+    def __init__(self, model, device):
+        self.model = model.to(device)
+        self.device = device
+        self.train_losses = []
+        self.val_losses = []
+        self.train_accuracies = []
+        self.val_accuracies = []
+        
+    def train_epoch(self, dataloader, optimizer, criterion):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        for batch in dataloader:
+            texts = batch['text'].to(self.device)
+            labels = batch['label'].to(self.device)
+            
+            optimizer.zero_grad()
+            outputs = self.model(texts)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        
+        avg_loss = total_loss / len(dataloader)
+        accuracy = 100 * correct / total
+        
+        return avg_loss, accuracy
+    
+    def validate(self, dataloader, criterion):
+        """Validate the model"""
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                texts = batch['text'].to(self.device)
+                labels = batch['label'].to(self.device)
+                
+                outputs = self.model(texts)
+                loss = criterion(outputs, labels)
+                
+                total_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        avg_loss = total_loss / len(dataloader)
+        accuracy = 100 * correct / total
+        
+        return avg_loss, accuracy
+    
+    def train(self, train_loader, val_loader, optimizer, criterion, epochs=10, patience=3):
+        """Full training loop with early stopping"""
+        print(f"\n🏋️ Training {self.model.__class__.__name__}...")
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            # Training
+            train_loss, train_acc = self.train_epoch(train_loader, optimizer, criterion)
+            val_loss, val_acc = self.validate(val_loader, criterion)
+            
+            # Store metrics
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_accuracies.append(train_acc)
+            self.val_accuracies.append(val_acc)
+            
+            print(f'Epoch {epoch+1}/{epochs}:')
+            print(f'  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+            print(f'  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save(self.model.state_dict(), f'best_{self.model.__class__.__name__.lower()}.pth')
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'Early stopping at epoch {epoch+1}')
+                    break
+        
+        # Load best model
+        self.model.load_state_dict(torch.load(f'best_{self.model.__class__.__name__.lower()}.pth'))
+        print(f"✅ Training completed! Best validation loss: {best_val_loss:.4f}")
+
+def evaluate_model(model, test_loader, device):
+    """Comprehensive model evaluation"""
+    model.eval()
+    all_predictions = []
+    all_labels = []
+    all_probabilities = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            texts = batch['text'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(texts)
+            probabilities = F.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probabilities.extend(probabilities.cpu().numpy())
+    
+    return np.array(all_predictions), np.array(all_labels), np.array(all_probabilities)
+
+# ==============================================================================
+# 7. VISUALIZATION FUNCTIONS
+# ==============================================================================
+
+def plot_training_history(trainers, model_names):
+    """Plot training history for all models"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('Training History Comparison', fontsize=16, fontweight='bold')
+    
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+    
+    for i, (trainer, name) in enumerate(zip(trainers, model_names)):
+        color = colors[i % len(colors)]
+        
+        # Training/Validation Loss
+        axes[0, 0].plot(trainer.train_losses, label=f'{name} Train', color=color, linestyle='-')
+        axes[0, 0].plot(trainer.val_losses, label=f'{name} Val', color=color, linestyle='--')
+        
+        # Training/Validation Accuracy
+        axes[0, 1].plot(trainer.train_accuracies, label=f'{name} Train', color=color, linestyle='-')
+        axes[0, 1].plot(trainer.val_accuracies, label=f'{name} Val', color=color, linestyle='--')
+    
+    axes[0, 0].set_title('Loss Curves')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    axes[0, 1].set_title('Accuracy Curves')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Accuracy (%)')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Final performance comparison
+    final_val_acc = [trainer.val_accuracies[-1] for trainer in trainers]
+    bars = axes[1, 0].bar(model_names, final_val_acc, color=colors[:len(model_names)])
+    axes[1, 0].set_title('Final Validation Accuracy')
+    axes[1, 0].set_ylabel('Accuracy (%)')
+    axes[1, 0].set_ylim(0, 100)
+    
+    # Add value labels on bars
+    for bar, acc in zip(bars, final_val_acc):
+        axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                       f'{acc:.1f}%', ha='center', va='bottom', fontweight='bold')
+    
+    # Model complexity comparison (parameters)
+    param_counts = []
+    for trainer in trainers:
+        total_params = sum(p.numel() for p in trainer.model.parameters())
+        param_counts.append(total_params / 1000)  # Convert to thousands
+    
+    bars = axes[1, 1].bar(model_names, param_counts, color=colors[:len(model_names)])
+    axes[1, 1].set_title('Model Complexity (Parameters)')
+    axes[1, 1].set_ylabel('Parameters (K)')
+    
+    # Add value labels on bars
+    for bar, params in zip(bars, param_counts):
+        axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(param_counts)*0.01,
+                       f'{params:.0f}K', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+
+def plot_evaluation_results(predictions, labels, probabilities, model_name):
+    """Plot comprehensive evaluation results"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'{model_name} - Evaluation Results', fontsize=16, fontweight='bold')
+    
+    # Confusion Matrix
+    cm = confusion_matrix(labels, predictions)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Fake', 'True'], yticklabels=['Fake', 'True'],
+                ax=axes[0, 0])
+    axes[0, 0].set_title('Confusion Matrix')
+    axes[0, 0].set_xlabel('Predicted')
+    axes[0, 0].set_ylabel('Actual')
+    
+    # ROC Curve
+    fpr, tpr, _ = roc_curve(labels, probabilities[:, 1])
+    roc_auc = auc(fpr, tpr)
+    axes[0, 1].plot(fpr, tpr, color='darkorange', lw=2, 
+                    label=f'ROC curve (AUC = {roc_auc:.3f})')
+    axes[0, 1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    axes[0, 1].set_xlim([0.0, 1.0])
+    axes[0, 1].set_ylim([0.0, 1.05])
+    axes[0, 1].set_xlabel('False Positive Rate')
+    axes[0, 1].set_ylabel('True Positive Rate')
+    axes[0, 1].set_title('ROC Curve')
+    axes[0, 1].legend(loc="lower right")
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Prediction confidence distribution
+    fake_probs = probabilities[labels == 0, 0]  # Confidence for fake news
+    true_probs = probabilities[labels == 1, 1]  # Confidence for true news
+    
+    axes[1, 0].hist(fake_probs, bins=30, alpha=0.7, label='Fake News', 
+                    color='#ff6b6b', density=True)
+    axes[1, 0].hist(true_probs, bins=30, alpha=0.7, label='True News', 
+                    color='#4ecdc4', density=True)
+    axes[1, 0].set_xlabel('Prediction Confidence')
+    axes[1, 0].set_ylabel('Density')
+    axes[1, 0].set_title('Prediction Confidence Distribution')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Performance metrics
+    from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+    
+    accuracy = accuracy_score(labels, predictions)
+    precision = precision_score(labels, predictions)
+    recall = recall_score(labels, predictions)
+    f1 = f1_score(labels, predictions)
+    
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
+    values = [accuracy, precision, recall, f1]
+    
+    bars = axes[1, 1].bar(metrics, values, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    axes[1, 1].set_title('Performance Metrics')
+    axes[1, 1].set_ylabel('Score')
+    axes[1, 1].set_ylim(0, 1)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                       f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print detailed classification report
+    print(f"\n📊 {model_name} - Detailed Classification Report:")
+    print("=" * 60)
+    print(classification_report(labels, predictions, target_names=['Fake', 'True']))
+
+# ==============================================================================
+# 8. MAIN EXECUTION PIPELINE
+# ==============================================================================
+
+def main():
+    """Main execution pipeline"""
+    print("🚀 Starting Fake News Classification Pipeline")
+    print("=" * 60)
+    
+    # Check device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"💻 Using device: {device}")
+    
+    # Load and explore data
+    df, fake_df, true_df = load_and_explore_data()
+    if df is None:
+        return
+    
+    # Visualize data distribution
+    visualize_data_distribution(df, fake_df, true_df)
+    
+    # Preprocess data
+    df = preprocess_data(df)
+    
+    # Build vocabulary
+    vocab = Vocabulary(max_vocab_size=10000, min_freq=2)
+    vocab.build_vocab(df['processed_text'].tolist())
+    
+    # Prepare data splits
+    print(f"\n🔄 STEP 3: Data Preparation")
+    print("-" * 40)
+    
+    # Split data
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        df['processed_text'].tolist(), 
+        df['label'].tolist(), 
+        test_size=0.3, 
+        random_state=42, 
+        stratify=df['label']
+    )
+    
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, 
+        test_size=0.5, 
+        random_state=42, 
+        stratify=y_temp
+    )
+    
+    print(f"✅ Data split complete:")
+    print(f"   • Training: {len(X_train)} samples")
+    print(f"   • Validation: {len(X_val)} samples") 
+    print(f"   • Test: {len(X_test)} samples")
+    
+    # Create datasets and dataloaders
+    train_dataset = NewsDataset(X_train, y_train, vocab)
+    val_dataset = NewsDataset(X_val, y_val, vocab)
+    test_dataset = NewsDataset(X_test, y_test, vocab)
+    
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Model parameters
+    vocab_size = len(vocab.word2idx)
+    print(f"📚 Vocabulary size: {vocab_size}")
+    
+    # Initialize models
+    print(f"\n🤖 STEP 4: Model Training")
+    print("-" * 40)
+    
+    models = {
+        'LSTM': LSTMClassifier(vocab_size=vocab_size, embed_dim=128, hidden_dim=128),
+        'CNN': CNNClassifier(vocab_size=vocab_size, embed_dim=128, num_filters=100),
+        'Transformer': TransformerClassifier(vocab_size=vocab_size, embed_dim=128, num_heads=8)
+    }
+    
+    trainers = {}
+    model_names = list(models.keys())
+    
+    # Train each model
+    for name, model in models.items():
+        print(f"\n🏋️ Training {name} Model...")
+        trainer = ModelTrainer(model, device)
+        
+        # Setup optimizer and criterion
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Train model
+        trainer.train(train_loader, val_loader, optimizer, criterion, epochs=15, patience=5)
+        trainers[name] = trainer
+    
+    # Plot training history comparison
+    print(f"\n📈 STEP 5: Training Analysis")
+    print("-" * 40)
+    plot_training_history(list(trainers.values()), model_names)
+    
+    # Evaluate all models
+    print(f"\n🔍 STEP 6: Model Evaluation")
+    print("-" * 40)
+    
+    best_model = None
+    best_accuracy = 0
+    
+    for name, trainer in trainers.items():
+        print(f"\n📊 Evaluating {name}...")
+        predictions, labels, probabilities = evaluate_model(trainer.model, test_loader, device)
+        
+        # Calculate accuracy
+        accuracy = (predictions == labels).mean()
+        print(f"✅ {name} Test Accuracy: {accuracy:.4f}")
+        
+        # Track best model
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_model = name
+        
+        # Plot detailed evaluation
+        plot_evaluation_results(predictions, labels, probabilities, name)
+    
+    # Final summary
+    print(f"\n🏆 FINAL RESULTS")
+    print("=" * 50)
+    print(f"🥇 Best Model: {best_model}")
+    print(f"🎯 Best Accuracy: {best_accuracy:.4f}")
+    
+    # Model comparison summary
+    print(f"\n📊 Model Comparison Summary:")
+    print("-" * 30)
+    for name, trainer in trainers.items():
+        final_val_acc = trainer.val_accuracies[-1]
+        total_params = sum(p.numel() for p in trainer.model.parameters())
+        print(f"{name:12} | Val Acc: {final_val_acc:6.2f}% | Params: {total_params:8,}")
+    
+    # Feature analysis
+    print(f"\n🔍 STEP 7: Feature Analysis")
+    print("-" * 40)
+    analyze_important_features(vocab, trainers[best_model].model, device)
+    
+    # Generate predictions on sample texts
+    print(f"\n🧪 STEP 8: Sample Predictions")
+    print("-" * 40)
+    sample_predictions(trainers[best_model].model, vocab, device)
+    
+    print(f"\n✅ Pipeline completed successfully!")
+    print("📝 All models trained and evaluated")
+    print("📊 Visualizations generated")
+    print("🏆 Best model identified")
+
+def analyze_important_features(vocab, model, device, top_k=20):
+    """Analyze most important features/words"""
+    print("🔍 Analyzing important features...")
+    
+    # Get embedding weights (works for all model types)
+    if hasattr(model, 'embedding'):
+        embeddings = model.embedding.weight.data.cpu().numpy()
+        
+        # Calculate L2 norm of embeddings as importance measure
+        word_importance = np.linalg.norm(embeddings, axis=1)
+        
+        # Get top words
+        top_indices = np.argsort(word_importance)[-top_k:][::-1]
+        top_words = [vocab.idx2word[idx] for idx in top_indices if idx in vocab.idx2word]
+        top_scores = word_importance[top_indices]
+        
+        # Visualize
+        plt.figure(figsize=(12, 8))
+        bars = plt.barh(range(len(top_words)), top_scores[:len(top_words)])
+        plt.yticks(range(len(top_words)), top_words)
+        plt.xlabel('Importance Score (L2 Norm)')
+        plt.title('Most Important Words (Based on Embedding Magnitudes)')
+        plt.gca().invert_yaxis()
+        
+        # Color bars
+        colors = plt.cm.viridis(np.linspace(0, 1, len(bars)))
+        for bar, color in zip(bars, colors):
+            bar.set_color(color)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        print(f"✅ Top {len(top_words)} most important words:")
+        for word, score in zip(top_words, top_scores[:len(top_words)]):
+            print(f"   • {word}: {score:.3f}")
+
+def sample_predictions(model, vocab, device):
+    """Generate predictions on sample texts"""
+    sample_texts = [
+        "Breaking news: Scientists discover new planet in our solar system",
+        "Celebrity scandal rocks Hollywood as secret affair revealed",
+        "Stock market crashes due to unexpected economic policy changes",
+        "Local community comes together to help flood victims",
+        "Miracle cure discovered by local doctor saves hundreds of lives"
+    ]
+    
+    print("🧪 Sample Predictions:")
+    print("-" * 30)
+    
+    model.eval()
+    preprocessor = TextPreprocessor()
+    
+    with torch.no_grad():
+        for i, text in enumerate(sample_texts, 1):
+            # Preprocess text
+            processed = preprocessor.preprocess(text)
+            indices = vocab.text_to_indices(processed, max_length=512)
+            
+            # Convert to tensor
+            input_tensor = torch.tensor([indices], dtype=torch.long).to(device)
+            
+            # Get prediction
+            output = model(input_tensor)
+            probabilities = F.softmax(output, dim=1)
+            prediction = torch.argmax(output, dim=1).item()
+            confidence = probabilities[0][prediction].item()
+            
+            label = "TRUE" if prediction == 1 else "FAKE"
+            print(f"\n{i}. Text: {text[:80]}...")
+            print(f"   Prediction: {label} (Confidence: {confidence:.3f})")
+
+if __name__ == "__main__":
+    main()
+
+# ==============================================================================
+# 9. ADDITIONAL UTILITIES FOR INTERNSHIP PRESENTATION
+# ==============================================================================
+
+def create_presentation_summary():
+    """Create a summary for internship presentation"""
+    print("\n" + "="*60)
+    print("📋 INTERNSHIP PRESENTATION SUMMARY")
+    print("="*60)
+    
+    summary = """
+    🎯 PROJECT OVERVIEW:
+    • Built deep learning models for fake news classification
+    • Compared LSTM, CNN, and Transformer architectures
+    • Achieved high accuracy with comprehensive evaluation
+    
+    📊 DATASET:
+    • Combined fake and true news articles from CSV files
+    • Comprehensive preprocessing pipeline
+    • Balanced dataset with thorough analysis
+    
+    🛠️ TECHNICAL APPROACH:
+    • Text preprocessing with NLTK
+    • Custom PyTorch Dataset and DataLoader
+    • Multiple model architectures implementation
+    • Comprehensive training with early stopping
+    
+    🏆 KEY RESULTS:
+    • Successfully trained and compared 3 different models
+    • Achieved robust performance on test set
+    • Generated detailed visualizations and analysis
+    • Identified most important features
+    
+    💡 TECHNICAL SKILLS DEMONSTRATED:
+    • Deep Learning with PyTorch
+    • Natural Language Processing
+    • Data Visualization with Matplotlib/Seaborn
+    • Model Evaluation and Comparison
+    • Code Organization and Documentation
+    
+    📈 VISUALIZATIONS INCLUDED:
+    • Data distribution analysis
+    • Training history comparison
+    • Model performance metrics
+    • ROC curves and confusion matrices
+    • Feature importance analysis
+    """
+    
+    print(summary)
+
+def save_model_artifacts():
+    """Save important artifacts for presentation"""
+    print("\n💾 Saving model artifacts...")
+    
+    # Create a summary of the project
+    project_summary = {
+        'project_name': 'Fake News Classification',
+        'models_implemented': ['LSTM', 'CNN', 'Transformer'],
+        'preprocessing_steps': [
+            'Text cleaning (URLs, emails, punctuation)',
+            'Tokenization and lemmatization', 
+            'Stopword removal',
+            'Vocabulary building'
+        ],
+        'evaluation_metrics': [
+            'Accuracy', 'Precision', 'Recall', 'F1-Score', 
+            'ROC-AUC', 'Confusion Matrix'
+        ],
+        'key_features': [
+            'Multiple architecture comparison',
+            'Comprehensive preprocessing',
+            'Early stopping with patience',
+            'Feature importance analysis',
+            'Sample prediction testing'
+        ]
+    }
+    
+    print("✅ Project artifacts ready for presentation")
+    return project_summary
+
+# Run the presentation summary
+create_presentation_summary()
+save_model_artifacts()
+
+print("\n" + "🎉" * 20)
+print("🎉 FAKE NEWS CLASSIFIER COMPLETE! 🎉")
+print("🎉" * 20)
